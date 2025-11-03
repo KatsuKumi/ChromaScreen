@@ -22,16 +22,16 @@
 
         <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
             <TextBlock Text="Chroma Key Threshold:" VerticalAlignment="Center" Margin="0,0,10,0"/>
-            <Slider x:Name="ThresholdSlider" Width="200" Minimum="0" Maximum="100" Value="30"
-                    TickFrequency="10" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
+            <Slider x:Name="ThresholdSlider" Width="200" Minimum="0" Maximum="100" Value="20"
+                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
             <TextBlock Text="{Binding ElementName=ThresholdSlider, Path=Value, StringFormat={}{0:F0}}"
                        VerticalAlignment="Center" Margin="10,0,0,0" Width="30"/>
         </StackPanel>
 
         <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,10">
             <TextBlock Text="Update Rate (ms):" VerticalAlignment="Center" Margin="0,0,10,0"/>
-            <Slider x:Name="UpdateRateSlider" Width="200" Minimum="16" Maximum="500" Value="33"
-                    TickFrequency="10" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
+            <Slider x:Name="UpdateRateSlider" Width="200" Minimum="8" Maximum="500" Value="8"
+                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
             <TextBlock Text="{Binding ElementName=UpdateRateSlider, Path=Value, StringFormat={}{0:F0}}"
                        VerticalAlignment="Center" Margin="10,0,0,0" Width="30"/>
         </StackPanel>
@@ -50,13 +50,13 @@
 
             <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
                 <TextBlock Text="Top:" VerticalAlignment="Center" Margin="0,0,5,0" Width="35"/>
-                <TextBox x:Name="CropTopTextBox" Width="50" Text="36" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBox x:Name="CropTopTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
 
                 <TextBlock Text="Left:" VerticalAlignment="Center" Margin="0,0,5,0" Width="35"/>
-                <TextBox x:Name="CropLeftTextBox" Width="50" Text="1" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBox x:Name="CropLeftTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
 
                 <TextBlock Text="Right:" VerticalAlignment="Center" Margin="0,0,5,0" Width="35"/>
-                <TextBox x:Name="CropRightTextBox" Width="50" Text="1" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBox x:Name="CropRightTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
 
                 <TextBlock Text="Bottom:" VerticalAlignment="Center" Margin="0,0,5,0" Width="50"/>
                 <TextBox x:Name="CropBottomTextBox" Width="50" Text="0" VerticalAlignment="Center"/>
