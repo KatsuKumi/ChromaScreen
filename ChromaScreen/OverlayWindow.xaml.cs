@@ -1,10 +1,16 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Interop;
+using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using Vortice.D3DCompiler;
 using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX;
@@ -21,6 +27,7 @@ public partial class OverlayWindow : Window
     private readonly int _cropLeft;
     private readonly int _cropRight;
     private readonly int _cropBottom;
+    private readonly int _targetFrameTime;
 
     private GraphicsCaptureItem? _captureItem;
     private Direct3D11CaptureFramePool? _framePool;
@@ -30,6 +37,40 @@ public partial class OverlayWindow : Window
     private IDirect3DDevice? _device;
     private SizeInt32 _lastSize;
     private readonly object _lock = new object();
+    private long _lastProcessedFrameTime;
+
+    // Performance metrics
+    private readonly Stopwatch _performanceTimer = new Stopwatch();
+    private long _frameCount = 0;
+    private long _totalGpuCopyTime = 0;
+    private long _totalChromaKeyTime = 0;
+    private long _lastFpsReport = 0;
+
+    // InteropBitmap with shared memory for ultra-fast rendering
+    private InteropBitmap? _interopBitmap = null;
+    private IntPtr _sharedMemorySection = IntPtr.Zero;
+    private IntPtr _sharedMemoryMap = IntPtr.Zero;
+    private int _lastBitmapWidth = 0;
+    private int _lastBitmapHeight = 0;
+
+    // Reusable buffer to eliminate allocations (14.7MB per frame!)
+    private byte[]? _pixelBuffer = null;
+
+    // P/Invoke for shared memory (InteropBitmap)
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateFileMapping(IntPtr hFile, IntPtr lpFileMappingAttributes, uint flProtect, uint dwMaximumSizeHigh, uint dwMaximumSizeLow, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr MapViewOfFile(IntPtr hFileMappingObject, uint dwDesiredAccess, uint dwFileOffsetHigh, uint dwFileOffsetLow, uint dwNumberOfBytesToMap);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool UnmapViewOfFile(IntPtr lpBaseAddress);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private const uint PAGE_READWRITE = 0x04;
+    private const uint FILE_MAP_ALL_ACCESS = 0xF001F;
 
     public OverlayWindow(IntPtr targetWindowHandle, int chromaKeyThreshold, int updateRate,
         int cropTop = 0, int cropLeft = 0, int cropRight = 0, int cropBottom = 0)
@@ -42,6 +83,8 @@ public partial class OverlayWindow : Window
         _cropLeft = cropLeft;
         _cropRight = cropRight;
         _cropBottom = cropBottom;
+        _targetFrameTime = updateRate; // Frame time in milliseconds
+        _lastProcessedFrameTime = 0;
 
         Loaded += OverlayWindow_Loaded;
         Closed += OverlayWindow_Closed;
@@ -52,6 +95,24 @@ public partial class OverlayWindow : Window
     {
         try
         {
+            // Increase process priority to prevent Windows Efficiency Mode throttling
+            using (var process = Process.GetCurrentProcess())
+            {
+                try
+                {
+                    // Set to High priority to compete with GPU-intensive games
+                    process.PriorityClass = ProcessPriorityClass.High;
+                }
+                catch
+                {
+                    // Fallback to AboveNormal if High fails
+                    try { process.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
+                }
+            }
+
+            // Increase current thread priority for capture operations
+            Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+
             StartCapture();
         }
         catch (Exception ex)
@@ -92,8 +153,6 @@ public partial class OverlayWindow : Window
             throw new InvalidOperationException("Failed to create GraphicsCaptureItem");
         }
 
-        System.Diagnostics.Debug.WriteLine($"Capture item created: {_captureItem.Size.Width}x{_captureItem.Size.Height}");
-
         // Create frame pool
         _lastSize = _captureItem.Size;
         _framePool = Direct3D11CaptureFramePool.Create(
@@ -108,46 +167,67 @@ public partial class OverlayWindow : Window
         // Start capture session
         _session = _framePool.CreateCaptureSession(_captureItem);
         _session.StartCapture();
-
-        System.Diagnostics.Debug.WriteLine("Capture started successfully");
     }
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
-        lock (_lock)
+        // IMPORTANT: Always consume frames from pool to prevent buffer exhaustion
+        using var frame = sender.TryGetNextFrame();
+        if (frame == null) return;
+
+        // Frame rate throttling - skip processing if too soon
+        long currentTime = Environment.TickCount64;
+        long timeSinceLastFrame = currentTime - _lastProcessedFrameTime;
+
+        if (_lastProcessedFrameTime > 0 && timeSinceLastFrame < _targetFrameTime)
         {
-            try
+            return; // Frame consumed but not processed (throttled)
+        }
+
+        // Use TryEnter to avoid blocking - skip frame if already processing
+        bool lockTaken = false;
+        try
+        {
+            Monitor.TryEnter(_lock, ref lockTaken);
+            if (!lockTaken) return; // Frame consumed but not processed (busy)
+
+            // Update timestamp BEFORE processing to prevent frame pile-up
+            _lastProcessedFrameTime = currentTime;
+
+            // Check if size changed
+            if (frame.ContentSize.Width != _lastSize.Width ||
+                frame.ContentSize.Height != _lastSize.Height)
             {
-                using var frame = sender.TryGetNextFrame();
-                if (frame == null) return;
+                _lastSize = frame.ContentSize;
 
-                // Check if size changed
-                if (frame.ContentSize.Width != _lastSize.Width ||
-                    frame.ContentSize.Height != _lastSize.Height)
-                {
-                    _lastSize = frame.ContentSize;
+                // Recreate frame pool
+                _framePool?.Dispose();
+                _framePool = Direct3D11CaptureFramePool.Create(
+                    _device!,
+                    DirectXPixelFormat.B8G8R8A8UIntNormalized,
+                    2,
+                    _lastSize);
+                _framePool.FrameArrived += OnFrameArrived;
 
-                    // Recreate frame pool
-                    _framePool?.Dispose();
-                    _framePool = Direct3D11CaptureFramePool.Create(
-                        _device!,
-                        DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                        2,
-                        _lastSize);
-                    _framePool.FrameArrived += OnFrameArrived;
-
-                    // Recreate session
-                    _session?.Dispose();
-                    _session = _framePool.CreateCaptureSession(_captureItem!);
-                    _session.StartCapture();
-                }
-
-                // Process frame
-                ProcessFrame(frame);
+                // Recreate session
+                _session?.Dispose();
+                _session = _framePool.CreateCaptureSession(_captureItem!);
+                _session.StartCapture();
+                return; // Skip this frame after resize
             }
-            catch (Exception ex)
+
+            // Process frame synchronously (DirectX requires same-thread access)
+            ProcessFrame(frame);
+        }
+        catch
+        {
+            // Silently ignore frame errors to avoid debug overhead
+        }
+        finally
+        {
+            if (lockTaken)
             {
-                System.Diagnostics.Debug.WriteLine($"Frame error: {ex.Message}");
+                Monitor.Exit(_lock);
             }
         }
     }
@@ -156,132 +236,277 @@ public partial class OverlayWindow : Window
     {
         try
         {
+            _performanceTimer.Restart();
+
             // Get the Direct3D11 surface
             var surface = GetDXGISurface(frame.Surface);
+            var desc = surface.Description;
+            var fullWidth = (int)desc.Width;
+            var fullHeight = (int)desc.Height;
 
-            // Copy texture data
-            using var stagingTexture = CreateStagingTexture(surface);
-            _d3dContext!.CopyResource(stagingTexture, surface);
+            // Calculate cropped dimensions
+            var croppedWidth = fullWidth - _cropLeft - _cropRight;
+            var croppedHeight = fullHeight - _cropTop - _cropBottom;
 
-            // Map the staging texture to CPU memory
-            var mapped = _d3dContext.Map(stagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+            // Validate crop margins
+            if (croppedWidth <= 0 || croppedHeight <= 0) return;
+
+            // GPU-SIDE CROPPING: Create smaller staging texture for cropped region only
+            using var croppedStagingTexture = CreateStagingTexture(croppedWidth, croppedHeight);
+
+            // Copy only the cropped region using GPU
+            var srcBox = new Vortice.Mathematics.Box(
+                _cropLeft,
+                _cropTop,
+                0,
+                _cropLeft + croppedWidth,
+                _cropTop + croppedHeight,
+                1
+            );
+
+            _d3dContext!.CopySubresourceRegion(
+                croppedStagingTexture,
+                0,
+                0, 0, 0,
+                surface,
+                0,
+                srcBox
+            );
+
+            long gpuCopyTime = _performanceTimer.ElapsedTicks;
+
+            // Map the cropped staging texture
+            var mapped = _d3dContext.Map(croppedStagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
 
             try
             {
-                var desc = stagingTexture.Description;
-                var fullWidth = (int)desc.Width;
-                var fullHeight = (int)desc.Height;
+                _performanceTimer.Restart();
 
-                // Calculate cropped dimensions
-                var croppedWidth = fullWidth - _cropLeft - _cropRight;
-                var croppedHeight = fullHeight - _cropTop - _cropBottom;
-
-                // Validate crop margins
-                if (croppedWidth <= 0 || croppedHeight <= 0)
+                // Reuse buffer to eliminate allocations (14.7MB per frame!)
+                int bufferSize = croppedWidth * croppedHeight * 4;
+                if (_pixelBuffer == null || _pixelBuffer.Length != bufferSize)
                 {
-                    System.Diagnostics.Debug.WriteLine("Invalid crop margins - result would be empty");
-                    return;
+                    _pixelBuffer = new byte[bufferSize];
+                }
+                var croppedData = _pixelBuffer;
+
+                // Copy pixel data efficiently using unsafe code
+                unsafe
+                {
+                    fixed (byte* destPtr = croppedData)
+                    {
+                        byte* srcPtr = (byte*)mapped.DataPointer;
+                        int rowBytes = croppedWidth * 4;
+
+                        // Copy row by row to handle potential stride differences
+                        for (int y = 0; y < croppedHeight; y++)
+                        {
+                            Buffer.MemoryCopy(
+                                srcPtr + (y * mapped.RowPitch),
+                                destPtr + (y * rowBytes),
+                                rowBytes,
+                                rowBytes
+                            );
+                        }
+                    }
                 }
 
-                // Copy pixel data
-                var pixelData = new byte[mapped.RowPitch * fullHeight];
-                Marshal.Copy(mapped.DataPointer, pixelData, 0, pixelData.Length);
+                long chromaKeyStart = _performanceTimer.ElapsedTicks;
 
-                // Create cropped buffer
-                var croppedData = new byte[croppedWidth * croppedHeight * 4];
+                // Apply chroma key processing
+                ApplyChromaKeySIMD(croppedData, croppedWidth, croppedHeight, croppedWidth * 4);
 
-                // Copy cropped region row by row
-                for (int y = 0; y < croppedHeight; y++)
+                long chromaKeyTime = _performanceTimer.ElapsedTicks - chromaKeyStart;
+
+                // Update performance metrics
+                _frameCount++;
+                _totalGpuCopyTime += gpuCopyTime;
+                _totalChromaKeyTime += chromaKeyTime;
+
+                // Report FPS every 60 frames
+                if (_frameCount % 60 == 0)
                 {
-                    int sourceOffset = (y + _cropTop) * mapped.RowPitch + (_cropLeft * 4);
-                    int destOffset = y * croppedWidth * 4;
-                    Array.Copy(pixelData, sourceOffset, croppedData, destOffset, croppedWidth * 4);
+                    long currentTime = Environment.TickCount64;
+                    if (_lastFpsReport > 0)
+                    {
+                        double elapsed = (currentTime - _lastFpsReport) / 1000.0;
+                        double fps = 60.0 / elapsed;
+                        double avgGpuCopy = (_totalGpuCopyTime / (double)_frameCount) / (Stopwatch.Frequency / 1000.0);
+                        double avgChromaKey = (_totalChromaKeyTime / (double)_frameCount) / (Stopwatch.Frequency / 1000.0);
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"FPS: {fps:F1} | GPU Copy: {avgGpuCopy:F2}ms | ChromaKey: {avgChromaKey:F2}ms | Resolution: {croppedWidth}x{croppedHeight}"
+                        );
+                    }
+                    _lastFpsReport = currentTime;
                 }
 
-                // Apply chroma key to cropped data
-                ApplyChromaKey(croppedData, croppedWidth, croppedHeight, croppedWidth * 4);
-
-                // Update UI with cropped image
-                Dispatcher.Invoke(() => UpdateImage(croppedData, croppedWidth, croppedHeight, croppedWidth * 4));
+                // Update UI immediately (synchronous) - no frame skipping!
+                // Synchronous Invoke means no queue backup, so always process
+                Dispatcher.Invoke(() => UpdateImage(croppedData, croppedWidth, croppedHeight, croppedWidth * 4),
+                    System.Windows.Threading.DispatcherPriority.Send);
             }
             finally
             {
-                _d3dContext.Unmap(stagingTexture, 0);
+                _d3dContext.Unmap(croppedStagingTexture, 0);
             }
         }
-        catch (Exception ex)
+        catch
         {
-            System.Diagnostics.Debug.WriteLine($"ProcessFrame error: {ex.Message}");
+            // Silently ignore errors to minimize overhead
         }
     }
 
-    private ID3D11Texture2D CreateStagingTexture(ID3D11Texture2D sourceTexture)
+    private ID3D11Texture2D CreateStagingTexture(int width, int height)
     {
-        var desc = sourceTexture.Description;
-        desc.Usage = ResourceUsage.Staging;
-        desc.BindFlags = BindFlags.None;
-        desc.CPUAccessFlags = CpuAccessFlags.Read;
-        desc.MiscFlags = ResourceOptionFlags.None;
+        var desc = new Texture2DDescription
+        {
+            Width = width,
+            Height = height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Read,
+            MiscFlags = ResourceOptionFlags.None
+        };
 
         return _d3dDevice!.CreateTexture2D(desc);
     }
 
-    private void ApplyChromaKey(byte[] pixels, int width, int height, int stride)
+    private unsafe void ApplyChromaKeySIMD(byte[] pixels, int width, int height, int stride)
     {
-        for (int y = 0; y < height; y++)
+        int threshold = _chromaKeyThreshold;
+
+        // Row-based parallel processing (faster than chunk-based for this workload)
+        Parallel.For(0, height, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, y =>
         {
-            for (int x = 0; x < width; x++)
+            unsafe
             {
-                int index = y * stride + x * 4;
-
-                byte b = pixels[index];
-                byte g = pixels[index + 1];
-                byte r = pixels[index + 2];
-
-                int brightness = (r + g + b) / 3;
-
-                if (brightness <= _chromaKeyThreshold)
+                fixed (byte* basePtr = pixels)
                 {
-                    pixels[index + 3] = 0; // Transparent
-                }
-                else
-                {
-                    pixels[index + 3] = 255; // Opaque
+                    byte* row = basePtr + (y * stride);
+                    int x = 0;
+
+                    // Process 8 pixels at a time (loop unrolling for better performance)
+                    int maxX = (width / 8) * 8;
+                    for (; x < maxX; x += 8)
+                    {
+                        int offset = x * 4;
+
+                        // Pixel 0
+                        int brightness0 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness0 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 1
+                        offset += 4;
+                        int brightness1 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness1 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 2
+                        offset += 4;
+                        int brightness2 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness2 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 3
+                        offset += 4;
+                        int brightness3 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness3 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 4
+                        offset += 4;
+                        int brightness4 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness4 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 5
+                        offset += 4;
+                        int brightness5 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness5 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 6
+                        offset += 4;
+                        int brightness6 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness6 <= threshold ? (byte)0 : (byte)255;
+
+                        // Pixel 7
+                        offset += 4;
+                        int brightness7 = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness7 <= threshold ? (byte)0 : (byte)255;
+                    }
+
+                    // Process remaining pixels
+                    for (; x < width; x++)
+                    {
+                        int offset = x * 4;
+                        int brightness = (row[offset + 2] + row[offset + 1] + row[offset]) / 3;
+                        row[offset + 3] = brightness <= threshold ? (byte)0 : (byte)255;
+                    }
                 }
             }
-        }
+        });
     }
 
-    private void UpdateImage(byte[] pixels, int width, int height, int sourceStride)
+    private unsafe void UpdateImage(byte[] pixels, int width, int height, int sourceStride)
     {
         try
         {
-            var wb = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
-
-            wb.Lock();
-            try
+            // Use InteropBitmap with shared memory - MUCH faster than WriteableBitmap!
+            if (_interopBitmap == null || _lastBitmapWidth != width || _lastBitmapHeight != height)
             {
-                // Copy row by row, accounting for DirectX texture stride (padding)
+                // Clean up old resources
+                if (_sharedMemoryMap != IntPtr.Zero)
+                {
+                    UnmapViewOfFile(_sharedMemoryMap);
+                    _sharedMemoryMap = IntPtr.Zero;
+                }
+                if (_sharedMemorySection != IntPtr.Zero)
+                {
+                    CloseHandle(_sharedMemorySection);
+                    _sharedMemorySection = IntPtr.Zero;
+                }
+
+                // Create shared memory section
+                uint byteCount = (uint)(width * height * 4);
+                _sharedMemorySection = CreateFileMapping(new IntPtr(-1), IntPtr.Zero, PAGE_READWRITE, 0, byteCount, null);
+                _sharedMemoryMap = MapViewOfFile(_sharedMemorySection, FILE_MAP_ALL_ACCESS, 0, 0, byteCount);
+
+                // Create InteropBitmap from shared memory
+                _interopBitmap = Imaging.CreateBitmapSourceFromMemorySection(
+                    _sharedMemorySection,
+                    width,
+                    height,
+                    PixelFormats.Bgra32,
+                    width * 4,
+                    0) as InteropBitmap;
+
+                _lastBitmapWidth = width;
+                _lastBitmapHeight = height;
+                OverlayImage.Source = _interopBitmap;
+            }
+
+            // Copy pixels directly to shared memory (no Lock/Unlock overhead!)
+            fixed (byte* srcPtr = pixels)
+            {
+                byte* dstPtr = (byte*)_sharedMemoryMap;
+                int rowBytes = width * 4;
+
+                // Fast memory copy
                 for (int y = 0; y < height; y++)
                 {
-                    // Source offset uses DirectX stride (with padding)
-                    // Destination offset uses WriteableBitmap stride
-                    Marshal.Copy(pixels, y * sourceStride,
-                        wb.BackBuffer + y * wb.BackBufferStride,
-                        width * 4);
+                    byte* src = srcPtr + (y * sourceStride);
+                    byte* dst = dstPtr + (y * rowBytes);
+                    Buffer.MemoryCopy(src, dst, rowBytes, rowBytes);
                 }
-                wb.AddDirtyRect(new Int32Rect(0, 0, width, height));
-            }
-            finally
-            {
-                wb.Unlock();
             }
 
-            OverlayImage.Source = wb;
+            // Tell WPF the bitmap has been updated (very fast call)
+            _interopBitmap?.Invalidate();
         }
-        catch (Exception ex)
+        catch
         {
-            System.Diagnostics.Debug.WriteLine($"UpdateImage error: {ex.Message}");
+            // Silently ignore errors to minimize overhead
         }
     }
 
@@ -331,7 +556,17 @@ public partial class OverlayWindow : Window
         _d3dContext?.Dispose();
         _d3dDevice?.Dispose();
 
-        System.Diagnostics.Debug.WriteLine("Capture stopped");
+        // Clean up shared memory
+        if (_sharedMemoryMap != IntPtr.Zero)
+        {
+            UnmapViewOfFile(_sharedMemoryMap);
+            _sharedMemoryMap = IntPtr.Zero;
+        }
+        if (_sharedMemorySection != IntPtr.Zero)
+        {
+            CloseHandle(_sharedMemorySection);
+            _sharedMemorySection = IntPtr.Zero;
+        }
     }
 
     [ComImport]
@@ -353,13 +588,7 @@ static class CaptureHelper
         try
         {
             // Verify window is valid
-            if (!IsWindow(hwnd))
-            {
-                System.Diagnostics.Debug.WriteLine($"Invalid window handle: {hwnd}");
-                return null;
-            }
-
-            System.Diagnostics.Debug.WriteLine($"Creating capture item for window: {hwnd}");
+            if (!IsWindow(hwnd)) return null;
 
             // Use the IGraphicsCaptureItemInterop COM interface
             var factoryTypeName = "Windows.Graphics.Capture.GraphicsCaptureItem";
@@ -367,43 +596,25 @@ static class CaptureHelper
 
             // Create HSTRING for the factory name
             var hrString = WindowsCreateString(factoryTypeName, factoryTypeName.Length, out var hstringFactory);
-            if (hrString != 0)
-            {
-                System.Diagnostics.Debug.WriteLine($"WindowsCreateString failed: {hrString:X}");
-                return null;
-            }
+            if (hrString != 0) return null;
 
             // Get the activation factory as IInspectable
             var hr = RoGetActivationFactory(hstringFactory, ref interopGuid, out var interopPtr);
             WindowsDeleteString(hstringFactory);
 
-            if (hr != 0 || interopPtr == IntPtr.Zero)
-            {
-                System.Diagnostics.Debug.WriteLine($"RoGetActivationFactory failed: {hr:X}");
-                return null;
-            }
+            if (hr != 0 || interopPtr == IntPtr.Zero) return null;
 
             try
             {
                 var interop = Marshal.GetObjectForIUnknown(interopPtr) as IGraphicsCaptureItemInterop;
-                if (interop == null)
-                {
-                    System.Diagnostics.Debug.WriteLine("Failed to cast to IGraphicsCaptureItemInterop");
-                    return null;
-                }
+                if (interop == null) return null;
 
-                var itemGuid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760"); // IGraphicsCaptureItem GUID
+                var itemGuid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
                 var itemPtr = interop.CreateForWindow(hwnd, itemGuid);
 
-                if (itemPtr == IntPtr.Zero)
-                {
-                    System.Diagnostics.Debug.WriteLine("CreateForWindow returned null");
-                    return null;
-                }
+                if (itemPtr == IntPtr.Zero) return null;
 
                 var item = MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPtr);
-                System.Diagnostics.Debug.WriteLine($"Successfully created capture item: {item?.Size.Width}x{item?.Size.Height}");
-
                 return item;
             }
             finally
@@ -414,10 +625,8 @@ static class CaptureHelper
                 }
             }
         }
-        catch (Exception ex)
+        catch
         {
-            System.Diagnostics.Debug.WriteLine($"CreateItemForWindow failed: {ex.Message}");
-            System.Diagnostics.Debug.WriteLine($"Stack trace: {ex.StackTrace}");
             return null;
         }
     }
