@@ -117,7 +117,7 @@ public partial class OverlayWindow : Window
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Failed to start capture: {ex.Message}\n\nStack: {ex.StackTrace}",
+            System.Windows.MessageBox.Show($"Failed to start capture: {ex.Message}\n\nStack: {ex.StackTrace}",
                 "Error", MessageBoxButton.OK, MessageBoxImage.Error);
             Close();
         }

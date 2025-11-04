@@ -7,11 +7,20 @@ namespace ChromaScreen;
 public partial class MainWindow : Window
 {
     private OverlayWindow? _overlayWindow;
+    private Thread? _veldridThread;
+    private VeldridOverlayWindow? _veldridOverlay;
 
     public MainWindow()
     {
         InitializeComponent();
         Loaded += MainWindow_Loaded;
+        Closing += MainWindow_Closing;
+    }
+
+    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // Clean up Veldrid overlay if running
+        _veldridOverlay?.Dispose();
     }
 
     private void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -35,11 +44,11 @@ public partial class MainWindow : Window
 
             // Parse crop margins with validation
             if (!int.TryParse(CropTopTextBox.Text, out int cropTop) || cropTop < 0)
-                cropTop = 36;
+                cropTop = 0;
             if (!int.TryParse(CropLeftTextBox.Text, out int cropLeft) || cropLeft < 0)
-                cropLeft = 1;
+                cropLeft = 0;
             if (!int.TryParse(CropRightTextBox.Text, out int cropRight) || cropRight < 0)
-                cropRight = 1;
+                cropRight = 0;
             if (!int.TryParse(CropBottomTextBox.Text, out int cropBottom) || cropBottom < 0)
                 cropBottom = 0;
 
@@ -54,11 +63,93 @@ public partial class MainWindow : Window
             );
             _overlayWindow.Show();
 
-            MessageBox.Show("Overlay started! Close the overlay window to stop.", "ChromaScreen", MessageBoxButton.OK, MessageBoxImage.Information);
+            System.Windows.MessageBox.Show("WPF Overlay started! Close the overlay window to stop.", "ChromaScreen", MessageBoxButton.OK, MessageBoxImage.Information);
         }
         else
         {
-            MessageBox.Show("Please select a window first.", "ChromaScreen", MessageBoxButton.OK, MessageBoxImage.Warning);
+            System.Windows.MessageBox.Show("Please select a window first.", "ChromaScreen", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void StartVeldridButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (WindowListBox.SelectedItem is WindowInfo selectedWindow)
+        {
+            // Clean up existing Veldrid overlay
+            if (_veldridOverlay != null)
+            {
+                _veldridOverlay.Dispose();
+                _veldridOverlay = null;
+            }
+
+            // Parse crop margins with validation
+            if (!int.TryParse(CropTopTextBox.Text, out int cropTop) || cropTop < 0)
+                cropTop = 0;
+            if (!int.TryParse(CropLeftTextBox.Text, out int cropLeft) || cropLeft < 0)
+                cropLeft = 0;
+            if (!int.TryParse(CropRightTextBox.Text, out int cropRight) || cropRight < 0)
+                cropRight = 0;
+            if (!int.TryParse(CropBottomTextBox.Text, out int cropBottom) || cropBottom < 0)
+                cropBottom = 0;
+
+            // Create Veldrid overlay
+            _veldridOverlay = new VeldridOverlayWindow(
+                selectedWindow.Handle,
+                (int)ThresholdSlider.Value,
+                (int)UpdateRateSlider.Value,
+                cropTop,
+                cropLeft,
+                cropRight,
+                cropBottom
+            );
+
+            // Run in separate thread (Veldrid requires its own message loop)
+            _veldridThread = new Thread(() =>
+            {
+                try
+                {
+                    System.Diagnostics.Debug.WriteLine("Starting Veldrid overlay...");
+                    _veldridOverlay.Show(); // Blocks until window closed
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Veldrid error: {ex}");
+                    Dispatcher.Invoke(() =>
+                    {
+                        System.Windows.MessageBox.Show(
+                            $"Veldrid overlay error: {ex.Message}\n\n" +
+                            $"Exception Type: {ex.GetType().Name}\n\n" +
+                            "This might be due to:\n" +
+                            "- Graphics drivers need updating\n" +
+                            "- DirectX 11 not available\n" +
+                            "- Shader compilation failed\n" +
+                            "- Window creation failed\n\n" +
+                            $"Full error:\n{ex}",
+                            "Veldrid Error",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Error);
+                    });
+                }
+            })
+            {
+                IsBackground = false,
+                Name = "VeldridOverlayThread"
+            };
+            _veldridThread.SetApartmentState(System.Threading.ApartmentState.STA);
+            _veldridThread.Start();
+
+            System.Windows.MessageBox.Show(
+                "Veldrid overlay started! (Hardware-Accelerated)\n\n" +
+                "This should be 3-4x faster than WPF overlay.\n" +
+                "Close the overlay window to stop.\n\n" +
+                "Check Debug Output in Visual Studio for FPS stats.",
+                "ChromaScreen - Veldrid",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+        else
+        {
+            System.Windows.MessageBox.Show("Please select a window first.", "ChromaScreen", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
