@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
@@ -28,6 +29,7 @@ public class VeldridOverlayWindow : IDisposable
     private readonly int _cropRight;
     private readonly int _cropBottom;
     private readonly int _targetFrameTime;
+    private readonly bool _isNetworkClient;
 
     // Native window
     private IntPtr _hwnd;
@@ -69,6 +71,13 @@ public class VeldridOverlayWindow : IDisposable
     private long _totalRenderTime = 0;
     private long _lastFpsReport = 0;
 
+    // Thread-safe frame queue for network client mode
+    private readonly ConcurrentQueue<PendingFrame> _frameQueue = new();
+    private const uint WM_RENDER_FRAME = 0x0400 + 1; // WM_USER + 1
+    private const uint WM_CLOSE = 0x0010;
+
+    private record struct PendingFrame(byte[] Data, int Width, int Height);
+
     // Win32 window styles for transparent overlay
     private const int WS_EX_TOPMOST = 0x00000008;
     private const int WS_EX_TRANSPARENT = 0x00000020;
@@ -78,6 +87,7 @@ public class VeldridOverlayWindow : IDisposable
     private const int WS_POPUP = unchecked((int)0x80000000);
     private const int GWL_EXSTYLE = -20;
     private const uint LWA_ALPHA = 0x00000002;
+    private const uint LWA_COLORKEY = 0x00000001;
 
     [DllImport("kernel32.dll")]
     private static extern uint GetLastError();
@@ -110,6 +120,9 @@ public class VeldridOverlayWindow : IDisposable
 
     [DllImport("user32.dll")]
     private static extern bool UpdateWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
@@ -189,7 +202,7 @@ public class VeldridOverlayWindow : IDisposable
     private WndProc? _wndProcDelegate;
 
     public VeldridOverlayWindow(IntPtr targetWindowHandle, int chromaKeyThreshold, int updateRate,
-        int cropTop = 0, int cropLeft = 0, int cropRight = 0, int cropBottom = 0)
+        int cropTop = 0, int cropLeft = 0, int cropRight = 0, int cropBottom = 0, bool isNetworkClient = false)
     {
         _targetWindowHandle = targetWindowHandle;
         _chromaKeyThreshold = chromaKeyThreshold;
@@ -199,6 +212,7 @@ public class VeldridOverlayWindow : IDisposable
         _cropBottom = cropBottom;
         _targetFrameTime = updateRate;
         _lastProcessedFrameTime = 0;
+        _isNetworkClient = isNetworkClient;
     }
 
     public void Show()
@@ -213,9 +227,16 @@ public class VeldridOverlayWindow : IDisposable
         InitializeVeldrid();
         Debug.WriteLine("VeldridOverlayWindow.Show: Veldrid initialized");
 
-        // Start capture
-        StartCapture();
-        Debug.WriteLine("VeldridOverlayWindow.Show: Capture started");
+        // Start capture (only if not a network client)
+        if (!_isNetworkClient)
+        {
+            StartCapture();
+            Debug.WriteLine("VeldridOverlayWindow.Show: Capture started");
+        }
+        else
+        {
+            Debug.WriteLine("VeldridOverlayWindow.Show: Network client mode - skipping capture");
+        }
 
         // Run message loop
         _isRunning = true;
@@ -310,10 +331,12 @@ public class VeldridOverlayWindow : IDisposable
         int currentStyle = GetWindowLong(_hwnd, GWL_EXSTYLE);
         Debug.WriteLine($"Current extended style: 0x{currentStyle:X}");
 
-        // Set layered window attributes for proper transparency and clickthrough
-        // Alpha = 255 (fully opaque), LWA_ALPHA flag enables alpha blending
-        SetLayeredWindowAttributes(_hwnd, 0, 255, LWA_ALPHA);
-        Debug.WriteLine("Layered window attributes set");
+        // Set layered window attributes for DirectX transparency
+        // Use LWA_COLORKEY instead of LWA_ALPHA for DirectX compatibility
+        // Black pixels (RGB 0,0,0) will be transparent - this works reliably with DXGI swap chains
+        // LWA_ALPHA doesn't work consistently with DirectX rendering, especially in network client mode
+        SetLayeredWindowAttributes(_hwnd, 0x00000000, 0, LWA_COLORKEY); // Color key = black (RGB 0,0,0)
+        Debug.WriteLine("Layered window attributes set (Color Key transparency)");
 
         // Enable DWM transparency for DirectX rendering
         MARGINS margins = new MARGINS { cxLeftWidth = -1, cxRightWidth = -1, cyTopHeight = -1, cyBottomHeight = -1 };
@@ -463,11 +486,15 @@ void main()
 {
     vec4 color = texture(sampler2D(SourceTexture, SourceSampler), fsin_TexCoords);
 
+    // TEMPORARY: Disable chroma key to test visibility
     // Calculate brightness
     float brightness = (color.r + color.g + color.b) / 3.0;
 
     // Apply chroma key threshold
     float alpha = brightness <= Threshold ? 0.0 : 1.0;
+
+    // OVERRIDE: Always show everything for testing
+    alpha = 1.0;
 
     fsout_Color = vec4(color.rgb, alpha);
 }";
@@ -688,15 +715,53 @@ void main()
             {
                 unsafe
                 {
-                    _graphicsDevice.UpdateTexture(
-                        _sourceTexture,
-                        (IntPtr)mapped.DataPointer,
-                        (uint)(croppedWidth * croppedHeight * 4),
-                        0, 0, 0,
-                        (uint)croppedWidth,
-                        (uint)croppedHeight,
-                        1,
-                        0, 0);
+                    // Account for row pitch (stride) - D3D11 textures may have padding at end of each row
+                    int rowPitch = mapped.RowPitch;
+                    int expectedRowSize = croppedWidth * 4; // BGRA = 4 bytes per pixel
+
+                    if (rowPitch == expectedRowSize)
+                    {
+                        // Tightly packed - can upload directly
+                        _graphicsDevice.UpdateTexture(
+                            _sourceTexture,
+                            (IntPtr)mapped.DataPointer,
+                            (uint)(croppedWidth * croppedHeight * 4),
+                            0, 0, 0,
+                            (uint)croppedWidth,
+                            (uint)croppedHeight,
+                            1,
+                            0, 0);
+                    }
+                    else
+                    {
+                        // Has padding - need to copy row by row into tightly packed buffer
+                        byte[] tightlyPackedData = new byte[croppedWidth * croppedHeight * 4];
+                        byte* srcPtr = (byte*)mapped.DataPointer;
+
+                        fixed (byte* dstPtr = tightlyPackedData)
+                        {
+                            for (int y = 0; y < croppedHeight; y++)
+                            {
+                                byte* srcRow = srcPtr + (y * rowPitch);
+                                byte* dstRow = dstPtr + (y * expectedRowSize);
+                                Buffer.MemoryCopy(srcRow, dstRow, expectedRowSize, expectedRowSize);
+                            }
+                        }
+
+                        // Upload tightly packed data
+                        fixed (byte* dataPtr = tightlyPackedData)
+                        {
+                            _graphicsDevice.UpdateTexture(
+                                _sourceTexture,
+                                (IntPtr)dataPtr,
+                                (uint)tightlyPackedData.Length,
+                                0, 0, 0,
+                                (uint)croppedWidth,
+                                (uint)croppedHeight,
+                                1,
+                                0, 0);
+                        }
+                    }
                 }
             }
             finally
@@ -769,7 +834,8 @@ void main()
         _commandList.Begin();
 
         _commandList.SetFramebuffer(_graphicsDevice.SwapchainFramebuffer);
-        _commandList.ClearColorTarget(0, RgbaFloat.Clear);
+        // Clear to black (0,0,0,1) - black pixels will be transparent via color key
+        _commandList.ClearColorTarget(0, new RgbaFloat(0, 0, 0, 1));
 
         _commandList.SetPipeline(_pipeline);
         _commandList.SetVertexBuffer(0, _vertexBuffer);
@@ -787,6 +853,102 @@ void main()
 
         _graphicsDevice.SubmitCommands(_commandList);
         _graphicsDevice.SwapBuffers();
+    }
+
+    /// <summary>
+    /// Render from network buffer (for ChromaNet client mode)
+    /// Thread-safe: can be called from any thread
+    /// </summary>
+    public void RenderFromBuffer(byte[] frameData, int width, int height)
+    {
+        // OPTIMIZED: Removed Console.WriteLine from hot path for performance
+        if (!_isNetworkClient || _hwnd == IntPtr.Zero)
+            return;
+
+        // Enqueue frame for rendering on overlay thread
+        _frameQueue.Enqueue(new PendingFrame(frameData, width, height));
+
+        // Post message to trigger rendering on overlay thread
+        PostMessage(_hwnd, WM_RENDER_FRAME, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    private void RenderFromBufferInternal(byte[] frameData, int width, int height)
+    {
+        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        if (_graphicsDevice == null || _commandList == null || !_isNetworkClient)
+            return;
+
+        try
+        {
+            if (_sourceTexture == null ||
+                _sourceTexture.Width != width ||
+                _sourceTexture.Height != height)
+            {
+                _sourceTexture?.Dispose();
+                _sourceTextureView?.Dispose();
+                _resourceSet?.Dispose();
+
+                _sourceTexture = _graphicsDevice.ResourceFactory.CreateTexture(new TextureDescription(
+                    (uint)width,
+                    (uint)height,
+                    1, 1, 1,
+                    PixelFormat.B8_G8_R8_A8_UNorm,
+                    TextureUsage.Sampled,
+                    TextureType.Texture2D));
+
+                _sourceTextureView = _graphicsDevice.ResourceFactory.CreateTextureView(_sourceTexture);
+
+                float normalizedThreshold = _chromaKeyThreshold / 255.0f;
+                DeviceBuffer chromaKeyBuffer = _graphicsDevice.ResourceFactory.CreateBuffer(
+                    new Veldrid.BufferDescription(16, BufferUsage.UniformBuffer));
+                _graphicsDevice.UpdateBuffer(chromaKeyBuffer, 0, normalizedThreshold);
+
+                _resourceSet = _graphicsDevice.ResourceFactory.CreateResourceSet(new ResourceSetDescription(
+                    _resourceLayout!,
+                    _sourceTextureView,
+                    _sampler!,
+                    chromaKeyBuffer
+                ));
+
+                CreatePipeline();
+
+                Debug.WriteLine($"[VeldridOverlay] Texture created: {width}x{height}");
+            }
+
+            var uploadStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            unsafe
+            {
+                fixed (byte* dataPtr = frameData)
+                {
+                    _graphicsDevice.UpdateTexture(
+                        _sourceTexture,
+                        (IntPtr)dataPtr,
+                        (uint)frameData.Length,
+                        0, 0, 0,
+                        (uint)width,
+                        (uint)height,
+                        1,
+                        0, 0);
+                }
+            }
+            uploadStopwatch.Stop();
+
+            var renderStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            RenderFrame();
+            renderStopwatch.Stop();
+
+            totalStopwatch.Stop();
+
+            Debug.WriteLine($"[VeldridOverlay] GPU Timing: Upload={uploadStopwatch.Elapsed.TotalMilliseconds:F2}ms | " +
+                          $"Render={renderStopwatch.Elapsed.TotalMilliseconds:F2}ms | " +
+                          $"Total={totalStopwatch.Elapsed.TotalMilliseconds:F2}ms");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[VeldridOverlay] Error rendering: {ex.Message}");
+            Debug.WriteLine($"[VeldridOverlay] Error: {ex.Message}");
+        }
     }
 
     private static ID3D11Texture2D GetDXGISurface(IDirect3DSurface surface)
@@ -860,8 +1022,25 @@ void main()
         {
             case WM_NCHITTEST:
                 // Return HTTRANSPARENT to make the window click-through
-                Debug.WriteLine("WM_NCHITTEST received - returning HTTRANSPARENT");
                 return new IntPtr(HTTRANSPARENT);
+
+            case WM_RENDER_FRAME:
+                // OPTIMIZED: Drop old frames if queue is building up - prioritize low latency
+                const int MAX_QUEUE_DEPTH = 2;
+
+                // Drop excess frames to maintain real-time performance
+                while (_frameQueue.Count > MAX_QUEUE_DEPTH)
+                {
+                    _frameQueue.TryDequeue(out _);  // Discard old frames
+                }
+
+                // Process most recent frame only
+                if (_frameQueue.TryDequeue(out var frame))
+                {
+                    RenderFromBufferInternal(frame.Data, frame.Width, frame.Height);
+                }
+
+                return IntPtr.Zero;
 
             case WM_CLOSE:
             case WM_DESTROY:
@@ -870,6 +1049,20 @@ void main()
         }
 
         return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+
+    /// <summary>
+    /// Gracefully close the overlay window and exit message loop
+    /// Thread-safe: can be called from any thread
+    /// </summary>
+    public void Close()
+    {
+        if (_hwnd != IntPtr.Zero)
+        {
+            // Send WM_CLOSE to window to gracefully exit message loop
+            PostMessage(_hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            Debug.WriteLine("[VeldridOverlay] Close() called - sent WM_CLOSE to window");
+        }
     }
 
     public void Dispose()
