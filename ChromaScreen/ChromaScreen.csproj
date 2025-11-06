@@ -24,4 +24,15 @@
         <PackageReference Include="Vortice.DXGI" Version="2.3.0" />
     </ItemGroup>
 
+    <ItemGroup>
+      <ProjectReference Include="ChromaNet\ChromaNet.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <!-- Exclude ChromaNet source files from ChromaScreen compilation -->
+      <Compile Remove="ChromaNet\**\*.cs" />
+      <EmbeddedResource Remove="ChromaNet\**\*" />
+      <None Remove="ChromaNet\**\*" />
+    </ItemGroup>
+
 </Project>
