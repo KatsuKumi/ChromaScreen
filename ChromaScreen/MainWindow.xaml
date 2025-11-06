@@ -4,72 +4,136 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="ChromaScreen - Window Selector" Height="550" Width="600"
+        Title="ChromaScreen - Overlay System" Height="650" Width="600"
         ResizeMode="CanMinimize">
-    <Grid Margin="10">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+    <TabControl Margin="10">
+        <!-- Local Mode Tab -->
+        <TabItem Header="Local Mode">
+            <Grid Margin="10">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
 
-        <TextBlock Grid.Row="0" Text="Select a window to capture:" FontSize="14" FontWeight="Bold" Margin="0,0,0,10"/>
+                <TextBlock Grid.Row="0" Text="Select a window to overlay:" FontSize="14" FontWeight="Bold" Margin="0,0,0,10"/>
 
-        <ListBox Grid.Row="1" x:Name="WindowListBox" DisplayMemberPath="Title" Margin="0,0,0,10"/>
+                <ListBox Grid.Row="1" x:Name="WindowListBox" DisplayMemberPath="Title" Margin="0,0,0,10"/>
 
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
-            <TextBlock Text="Chroma Key Threshold:" VerticalAlignment="Center" Margin="0,0,10,0"/>
-            <Slider x:Name="ThresholdSlider" Width="200" Minimum="0" Maximum="100" Value="20"
-                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
-            <TextBlock Text="{Binding ElementName=ThresholdSlider, Path=Value, StringFormat={}{0:F0}}"
-                       VerticalAlignment="Center" Margin="10,0,0,0" Width="30"/>
-        </StackPanel>
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+                    <TextBlock Text="Chroma Key Threshold:" VerticalAlignment="Center" Margin="0,0,10,0" Width="140"/>
+                    <Slider x:Name="ThresholdSlider" Width="200" Minimum="0" Maximum="100" Value="20"
+                            TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding ElementName=ThresholdSlider, Path=Value, StringFormat={}{0:F0}}"
+                               VerticalAlignment="Center" Margin="10,0,0,0" Width="30"/>
+                </StackPanel>
 
-        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,10">
-            <TextBlock Text="Update Rate (ms):" VerticalAlignment="Center" Margin="0,0,10,0"/>
-            <Slider x:Name="UpdateRateSlider" Width="200" Minimum="8" Maximum="500" Value="8"
-                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
-            <TextBlock Text="{Binding ElementName=UpdateRateSlider, Path=Value, StringFormat={}{0:F0}}"
-                       VerticalAlignment="Center" Margin="10,0,0,0" Width="30"/>
-        </StackPanel>
+                <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,10">
+                    <TextBlock Text="Update Rate (ms):" VerticalAlignment="Center" Margin="0,0,10,0" Width="140"/>
+                    <Slider x:Name="UpdateRateSlider" Width="200" Minimum="8" Maximum="500" Value="8"
+                            TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding ElementName=UpdateRateSlider, Path=Value, StringFormat={}{0:F0}}"
+                               VerticalAlignment="Center" Margin="10,0,0,0" Width="30"/>
+                </StackPanel>
 
-        <Grid Grid.Row="4" Margin="0,0,0,10">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
+                <GroupBox Grid.Row="4" Header="Crop Margins (pixels)" Margin="0,0,0,10">
+                    <StackPanel Margin="5" Orientation="Horizontal">
+                        <TextBlock Text="Top:" VerticalAlignment="Center" Margin="0,0,5,0" Width="50"/>
+                        <TextBox x:Name="CropTopTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
 
-            <TextBlock Grid.Row="0" Grid.Column="0" Text="Crop Margins:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,5"/>
+                        <TextBlock Text="Left:" VerticalAlignment="Center" Margin="0,0,5,0" Width="50"/>
+                        <TextBox x:Name="CropLeftTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
 
-            <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
-                <TextBlock Text="Top:" VerticalAlignment="Center" Margin="0,0,5,0" Width="35"/>
-                <TextBox x:Name="CropTopTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                        <TextBlock Text="Right:" VerticalAlignment="Center" Margin="0,0,5,0" Width="50"/>
+                        <TextBox x:Name="CropRightTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
 
-                <TextBlock Text="Left:" VerticalAlignment="Center" Margin="0,0,5,0" Width="35"/>
-                <TextBox x:Name="CropLeftTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                        <TextBlock Text="Bottom:" VerticalAlignment="Center" Margin="0,0,5,0" Width="50"/>
+                        <TextBox x:Name="CropBottomTextBox" Width="50" Text="0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </GroupBox>
 
-                <TextBlock Text="Right:" VerticalAlignment="Center" Margin="0,0,5,0" Width="35"/>
-                <TextBox x:Name="CropRightTextBox" Width="50" Text="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="RefreshButton" Content="Refresh Windows" Width="120" Height="35"
+                            Margin="0,0,10,0" Click="RefreshButton_Click"/>
+                    <Button x:Name="StartVeldridButton" Content="Start Overlay" Width="140" Height="35"
+                            Click="StartVeldridButton_Click" Background="#FF4CAF50" Foreground="White" FontWeight="Bold"/>
+                </StackPanel>
+            </Grid>
+        </TabItem>
 
-                <TextBlock Text="Bottom:" VerticalAlignment="Center" Margin="0,0,5,0" Width="50"/>
-                <TextBox x:Name="CropBottomTextBox" Width="50" Text="0" VerticalAlignment="Center"/>
-            </StackPanel>
-        </Grid>
+        <!-- Network Mode Tab -->
+        <TabItem Header="Network Mode (ChromaNet)">
+            <Grid Margin="10">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
 
-        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="RefreshButton" Content="Refresh Windows" Width="120" Height="30"
-                    Margin="0,0,10,0" Click="RefreshButton_Click"/>
-            <Button x:Name="StartButton" Content="Start WPF Overlay" Width="130" Height="30"
-                    Margin="0,0,10,0" Click="StartButton_Click"/>
-            <Button x:Name="StartVeldridButton" Content="Start Veldrid (Fast!)" Width="130" Height="30"
-                    Click="StartVeldridButton_Click" Background="#FF4CAF50" Foreground="White" FontWeight="Bold"/>
-        </StackPanel>
-    </Grid>
+                <!-- Chroma Mode Selection -->
+                <GroupBox Grid.Row="0" Header="Chroma Processing Mode" Margin="0,0,0,10">
+                    <ComboBox x:Name="ChromaModeSelector" Margin="5" SelectedIndex="0">
+                        <ComboBoxItem Content="Server processes chroma (RGBA - best if weak PC has spare CPU)" Tag="ServerSide"/>
+                        <ComboBoxItem Content="Client processes chroma (RGB - offload to powerful GPU)" Tag="ClientSide"/>
+                        <ComboBoxItem Content="No chroma processing (raw RGB)" Tag="None"/>
+                    </ComboBox>
+                </GroupBox>
+
+                <!-- Server Section -->
+                <GroupBox Grid.Row="1" Header="Server Mode (Capture Desktop)" BorderBrush="#FF4CAF50" BorderThickness="2" Margin="0,0,0,5">
+                    <StackPanel Margin="10">
+                        <TextBlock Text="Stream your desktop/monitor to clients over network"
+                                   FontStyle="Italic" Foreground="Gray" Margin="0,0,0,10"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <TextBlock Text="Monitor:" VerticalAlignment="Center" Margin="0,0,10,0" Width="80"/>
+                            <ComboBox x:Name="MonitorListBox" Width="300" DisplayMemberPath="DisplayName"/>
+                            <Button Content="🔄" Width="30" Height="25" Margin="5,0,0,0"
+                                    Click="RefreshMonitors_Click" ToolTip="Refresh monitor list"/>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <TextBlock Text="Listen Port:" VerticalAlignment="Center" Margin="0,0,10,0" Width="80"/>
+                            <TextBox x:Name="ServerPortTextBox" Text="7878" Width="100"/>
+                        </StackPanel>
+
+                        <Button x:Name="StartServerButton" Content="Start Server"
+                                Click="StartServerButton_Click" Height="35"
+                                Background="#FF4CAF50" Foreground="White" FontWeight="Bold"/>
+
+                        <TextBlock x:Name="ServerStatusText" Margin="0,10,0,0" FontStyle="Italic"
+                                   TextWrapping="Wrap" Foreground="#FF4CAF50"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- Client Section -->
+                <GroupBox Grid.Row="2" Header="Client Mode (Receive Stream)" BorderBrush="#FF2196F3" BorderThickness="2" Margin="0,5,0,0">
+                    <StackPanel Margin="10">
+                        <TextBlock Text="Connect to a server to display its desktop as an overlay"
+                                   FontStyle="Italic" Foreground="Gray" Margin="0,0,0,10"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <TextBlock Text="Server IP:" VerticalAlignment="Center" Margin="0,0,10,0" Width="80"/>
+                            <TextBox x:Name="ServerIpTextBox" Text="127.0.0.1" Width="150"/>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <TextBlock Text="Server Port:" VerticalAlignment="Center" Margin="0,0,10,0" Width="80"/>
+                            <TextBox x:Name="ClientPortTextBox" Text="7878" Width="100"/>
+                        </StackPanel>
+
+                        <Button x:Name="ConnectClientButton" Content="Connect to Server"
+                                Click="ConnectClientButton_Click" Height="35"
+                                Background="#FF2196F3" Foreground="White" FontWeight="Bold"/>
+
+                        <TextBlock x:Name="ClientStatusText" Margin="0,10,0,0" FontStyle="Italic"
+                                   TextWrapping="Wrap" Foreground="#FF2196F3"/>
+                    </StackPanel>
+                </GroupBox>
+            </Grid>
+        </TabItem>
+    </TabControl>
 </Window>
