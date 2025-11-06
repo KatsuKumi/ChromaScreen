@@ -53,45 +53,22 @@ public class ChromaNetServer : IDisposable
         _chromaMode = chromaMode;
         _chromaThreshold = chromaThreshold;
 
-        // Create desktop duplicator for specified monitor
         _duplicator = new DesktopDuplicator(monitorIndex);
 
-        // Create LiteNetLib server
-        _netManager = new NetManager(this)
+        if (!_isENetInitialized)
         {
-            AutoRecycle = true,
-            UpdateTime = 15, // 15ms update interval for ~60 FPS
-            UnconnectedMessagesEnabled = true
-        };
+            Library.Initialize();
+            _isENetInitialized = true;
+            Console.WriteLine("[ChromaNetServer] ENet library initialized");
+        }
 
-        _netManager.Start(port);
-
-        OptimizeSocketBuffers();
+        Address address = new Address();
+        address.Port = (ushort)port;
+        _server = new Host();
+        _server.Create(address, 32, 1);
 
         OnStatusUpdate?.Invoke($"Server started on port {port}");
-        Console.WriteLine($"[ChromaNetServer] Listening on port {port}");
-    }
-
-    private void OptimizeSocketBuffers()
-    {
-        try
-        {
-            var socketField = _netManager.GetType().GetField("_socket",
-                System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Instance);
-
-            if (socketField?.GetValue(_netManager) is System.Net.Sockets.Socket socket)
-            {
-                socket.SendBufferSize = 1024 * 512;
-                socket.ReceiveBufferSize = 1024 * 512;
-
-                Console.WriteLine($"[ChromaNetServer] Socket buffers optimized: Send={socket.SendBufferSize}, Recv={socket.ReceiveBufferSize}");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ChromaNetServer] Warning: Could not optimize socket buffers: {ex.Message}");
-        }
+        Console.WriteLine($"[ChromaNetServer] ENet server listening on port {port}");
     }
 
     /// <summary>
@@ -132,13 +109,14 @@ public class ChromaNetServer : IDisposable
         {
             try
             {
-                // Poll network events
-                _netManager.PollEvents();
-
-                // Only capture if we have connected clients
-                if (_netManager.ConnectedPeersCount == 0)
+                while (_server.Service(0, out Event netEvent) > 0)
                 {
-                    Thread.Sleep(16); // ~60 FPS
+                    HandleNetworkEvent(netEvent);
+                }
+
+                if (_connectedPeers.Count == 0)
+                {
+                    Thread.Sleep(16);
                     lastFrameTime = frameTimer.ElapsedMilliseconds;
                     continue;
                 }
@@ -189,6 +167,106 @@ public class ChromaNetServer : IDisposable
         Console.WriteLine("[ChromaNetServer] Capture loop stopped");
     }
 
+    private void HandleNetworkEvent(Event netEvent)
+    {
+        switch (netEvent.Type)
+        {
+            case EventType.Connect:
+                Console.WriteLine($"[ChromaNetServer] Client connected: {netEvent.Peer.IP}:{netEvent.Peer.Port} (ID: {netEvent.Peer.ID})");
+                _connectedPeers.Add(netEvent.Peer);
+                OnStatusUpdate?.Invoke($"Client connected: {netEvent.Peer.IP}");
+
+                SendFullScreenToClient(netEvent.Peer);
+                break;
+
+            case EventType.Disconnect:
+                Console.WriteLine($"[ChromaNetServer] Client disconnected: {netEvent.Peer.IP}");
+                _connectedPeers.Remove(netEvent.Peer);
+                OnStatusUpdate?.Invoke($"Client disconnected: {netEvent.Peer.IP}");
+                break;
+
+            case EventType.Timeout:
+                Console.WriteLine($"[ChromaNetServer] Client timeout: {netEvent.Peer.IP}");
+                _connectedPeers.Remove(netEvent.Peer);
+                OnStatusUpdate?.Invoke($"Client timeout: {netEvent.Peer.IP}");
+                break;
+
+            case EventType.Receive:
+                netEvent.Packet.Dispose();
+                break;
+
+            case EventType.None:
+                break;
+        }
+    }
+
+    private void SendFullScreenToClient(Peer peer)
+    {
+        try
+        {
+            var capture = _duplicator.CaptureFrame(0);
+            if (capture == null || !capture.Success)
+            {
+                Console.WriteLine("[ChromaNetServer] Warning: Could not capture full screen for new client");
+                return;
+            }
+
+            var fullScreenRegion = new Rectangle(0, 0, _duplicator.Width, _duplicator.Height);
+            var regions = new List<Rectangle> { fullScreenRegion };
+
+            var compressedRegions = CompressRegions(regions, capture.FrameData!);
+
+            var framePacket = new FramePacket(
+                _frameId,
+                (ushort)_duplicator.Width,
+                (ushort)_duplicator.Height,
+                _chromaMode,
+                _chromaThreshold);
+
+            foreach (var region in compressedRegions)
+            {
+                framePacket.Regions.Add(region);
+            }
+
+            byte[] data = MemoryPackSerializer.Serialize(framePacket);
+
+            Packet enetPacket = default;
+            enetPacket.Create(data, PacketFlags.Reliable);
+
+            peer.Send(0, ref enetPacket);
+
+            Console.WriteLine($"[ChromaNetServer] Sent full screen to new client ({data.Length / 1024} KB)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ChromaNetServer] Error sending full screen: {ex.Message}");
+        }
+    }
+
+    private List<Rectangle> DetectMajorChangeAndAdjustRegions(List<Rectangle> dirtyRegions)
+    {
+        if (dirtyRegions.Count == 0)
+            return dirtyRegions;
+
+        long totalDirtyPixels = 0;
+        foreach (var rect in dirtyRegions)
+        {
+            totalDirtyPixels += (long)rect.Width * rect.Height;
+        }
+
+        long screenPixels = (long)_duplicator.Width * _duplicator.Height;
+        double coveragePercent = (totalDirtyPixels * 100.0) / screenPixels;
+
+        const double MAJOR_CHANGE_THRESHOLD = 75.0;
+
+        if (coveragePercent >= MAJOR_CHANGE_THRESHOLD || dirtyRegions.Count > 100)
+        {
+            return new List<Rectangle> { new Rectangle(0, 0, _duplicator.Width, _duplicator.Height) };
+        }
+
+        return dirtyRegions;
+    }
+
     /// <summary>
     /// Process captured frame and send to all clients
     /// </summary>
@@ -198,8 +276,10 @@ public class ChromaNetServer : IDisposable
 
         var frameTimer = Stopwatch.StartNew();
 
+        var regions = DetectMajorChangeAndAdjustRegions(capture.DirtyRegions);
+
         var splitStopwatch = Stopwatch.StartNew();
-        var splitRegions = SplitLargeRegions(capture.DirtyRegions);
+        var splitRegions = SplitLargeRegions(regions);
         splitStopwatch.Stop();
 
         var compressStopwatch = Stopwatch.StartNew();
@@ -211,15 +291,6 @@ public class ChromaNetServer : IDisposable
         sendStopwatch.Stop();
 
         frameTimer.Stop();
-
-        if (frameTimer.ElapsedMilliseconds > 50)
-        {
-            Console.WriteLine($"[ChromaNetServer] SLOW FRAME: Total={frameTimer.ElapsedMilliseconds}ms " +
-                            $"(Split={splitStopwatch.ElapsedMilliseconds}ms, " +
-                            $"Compress={compressStopwatch.ElapsedMilliseconds}ms, " +
-                            $"Send={sendStopwatch.ElapsedMilliseconds}ms) " +
-                            $"Regions={splitRegions.Count}");
-        }
 
         long currentTime = _perfTimer.ElapsedMilliseconds;
         if (currentTime - _lastReport >= 1000)
@@ -283,12 +354,6 @@ public class ChromaNetServer : IDisposable
                 splitRegions.Add(dirtyRect);
                 totalTilesAfter++;
             }
-        }
-
-        if (shapeSplitCount > 0)
-        {
-            Console.WriteLine($"[ChromaNetServer] Split {shapeSplitCount} pathological regions " +
-                             $"(aspect ratio >{MAX_ASPECT_RATIO}:1) into tiles");
         }
 
         return splitRegions;
@@ -359,25 +424,13 @@ public class ChromaNetServer : IDisposable
         }
 
         extractTimer.Stop();
-        if (extractTimer.ElapsedMilliseconds > 20 && regions.Count > 0)
-        {
-            double avgPerRegion = (double)totalExtractMs / regions.Count;
-            int firstRegionSize = (regions[0].Width * regions[0].Height * 4) / 1024;
-            double compressionRatio = compressedCount > 0 ?
-                (double)compressedBytes / originalBytes : 1.0;
-
-            Console.WriteLine($"[ChromaNetServer] Frame Processing: " +
-                            $"Extract={totalExtractMs}ms, Compress={totalCompressMs}ms, " +
-                            $"Regions={regions.Count}, Compressed={compressedCount}/{regions.Count}, " +
-                            $"Ratio={compressionRatio:P0}");
-        }
 
         return compressedRegions;
     }
 
     private void SendRegionsBatched(List<DirtyRegion> compressedRegions, uint frameId)
     {
-        var packet = new FramePacket(
+        var framePacket = new FramePacket(
             frameId,
             (ushort)_duplicator.Width,
             (ushort)_duplicator.Height,
@@ -386,20 +439,19 @@ public class ChromaNetServer : IDisposable
 
         foreach (var region in compressedRegions)
         {
-            packet.Regions.Add(region);
+            framePacket.Regions.Add(region);
         }
 
-        byte[] data = MemoryPackSerializer.Serialize(packet);
-        DeliveryMethod method = DeliveryMethod.Unreliable;
+        byte[] data = MemoryPackSerializer.Serialize(framePacket);
 
-        if (method == DeliveryMethod.Unreliable)
-            _unreliablePackets++;
-        else
-            _reliablePackets++;
+        Packet enetPacket = default;
+        enetPacket.Create(data, PacketFlags.UnreliableFragmented);
 
-        foreach (var peer in _netManager.ConnectedPeerList)
+        _unreliablePackets++;
+
+        foreach (var peer in _connectedPeers)
         {
-            peer.Send(data, method);
+            peer.Send(0, ref enetPacket);
         }
 
         _frameCount++;
@@ -454,7 +506,7 @@ public class ChromaNetServer : IDisposable
             double reliablePercent = totalPackets > 0 ? (_reliablePackets * 100.0 / totalPackets) : 0;
 
             string stats = $"Updates: {updateRate:F1}/s | Sent: {sendFps:F1} FPS | BW: {mbps:F2} Mbps ({kbPerFrame:F1} KB/frame) | " +
-                          $"Dirty: {dirtyRegionCount} | Clients: {_netManager.ConnectedPeersCount}";
+                          $"Dirty: {dirtyRegionCount} | Clients: {_connectedPeers.Count}";
             string delivery = $"Delivery: Unreliable={_unreliablePackets}, Reliable={_reliablePackets} ({reliablePercent:F0}%)";
 
             OnStatusUpdate?.Invoke(stats);
@@ -480,62 +532,29 @@ public class ChromaNetServer : IDisposable
         _captureThread?.Join(1000);
     }
 
-    // INetEventListener implementation
-    public void OnPeerConnected(NetPeer peer)
-    {
-        Console.WriteLine($"[ChromaNetServer] Client connected: {peer.Address}:{peer.Port}");
-        OnStatusUpdate?.Invoke($"Client connected: {peer.Address}");
-    }
-
-    public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
-    {
-        Console.WriteLine($"[ChromaNetServer] Client disconnected: {peer.Address}");
-        OnStatusUpdate?.Invoke($"Client disconnected: {peer.Address}");
-    }
-
-    public void OnNetworkError(System.Net.IPEndPoint endPoint, System.Net.Sockets.SocketError socketError)
-    {
-        Console.WriteLine($"[ChromaNetServer] Network error: {socketError}");
-    }
-
-    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
-    {
-        // Server doesn't expect to receive data
-    }
-
-    public void OnNetworkReceiveUnconnected(System.Net.IPEndPoint remoteEndPoint, NetPacketReader reader, UnconnectedMessageType messageType)
-    {
-    }
-
-    public void OnNetworkLatencyUpdate(NetPeer peer, int latency)
-    {
-    }
-
-    public void OnConnectionRequest(ConnectionRequest request)
-    {
-        // Accept all connection requests
-        request.Accept();
-        Console.WriteLine($"[ChromaNetServer] Accepting connection from {request.RemoteEndPoint}");
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
 
-        // Disconnect all clients gracefully before shutting down
-        if (_netManager != null)
+        Console.WriteLine($"[ChromaNetServer] Disconnecting {_connectedPeers.Count} clients...");
+        foreach (var peer in _connectedPeers.ToList())
         {
-            Console.WriteLine($"[ChromaNetServer] Disconnecting {_netManager.ConnectedPeersCount} clients...");
-            foreach (var peer in _netManager.ConnectedPeerList.ToList())
-            {
-                peer.Disconnect();
-            }
+            peer.Disconnect(0);
         }
 
         Stop();
-        _netManager?.Stop();
-        _duplicator?.Dispose();
 
+        _server.Flush();
+        _server.Dispose();
+
+        if (_isENetInitialized)
+        {
+            Library.Deinitialize();
+            _isENetInitialized = false;
+            Console.WriteLine("[ChromaNetServer] ENet library deinitialized");
+        }
+
+        _duplicator?.Dispose();
         _disposed = true;
         Console.WriteLine("[ChromaNetServer] Server disposed");
     }
