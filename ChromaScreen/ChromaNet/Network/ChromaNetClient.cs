@@ -2,26 +2,28 @@ using System.Diagnostics;
 using System.Net;
 using ChromaNet.Compression;
 using ChromaNet.Core;
-using LiteNetLib;
-using LiteNetLib.Utils;
+using ENet;
 using MemoryPack;
 
 namespace ChromaNet.Network;
 
 /// <summary>
 /// ChromaNet client - receives and decompresses frames from server
+/// Migrated from LiteNetLib to ENet-CSharp for unreliable fragmentation support
 /// </summary>
-public class ChromaNetClient : IDisposable, INetEventListener
+public class ChromaNetClient : IDisposable
 {
-    private readonly NetManager _netManager;
+    private Host _client;
     private readonly string _serverAddress;
     private readonly int _serverPort;
-    private NetPeer? _serverPeer;
+    private Peer _serverPeer;
+    private bool _isConnected;
     private byte[]? _compositeBuffer;
     private int _screenWidth;
     private int _screenHeight;
     private bool _running;
     private bool _disposed;
+    private bool _isENetInitialized;
 
     // Performance tracking
     private readonly Stopwatch _perfTimer = Stopwatch.StartNew();
@@ -30,12 +32,9 @@ public class ChromaNetClient : IDisposable, INetEventListener
     private long _totalBytes = 0;
     private long _lastReport = 0;
 
-    // Callback interval tracking for FPS bottleneck diagnosis
-    private long _lastCallbackTime = 0;
-    private readonly Stopwatch _callbackIntervalTimer = Stopwatch.StartNew();
-
     public event Action<string>? OnStatusUpdate;
     public event Action<byte[], int, int, ChromaMode, byte>? OnFrameReceived;
+    public event Action? OnConnectionLost;
 
     /// <summary>
     /// Get current screen dimensions
@@ -52,40 +51,17 @@ public class ChromaNetClient : IDisposable, INetEventListener
         _serverAddress = serverAddress;
         _serverPort = serverPort;
 
-        // Create LiteNetLib client
-        _netManager = new NetManager(this)
+        if (!_isENetInitialized)
         {
-            AutoRecycle = true,
-            UpdateTime = 15 // 15ms update interval
-        };
+            Library.Initialize();
+            _isENetInitialized = true;
+            Console.WriteLine("[ChromaNetClient] ENet library initialized");
+        }
 
-        _netManager.Start();
-
-        OptimizeSocketBuffers();
+        _client = new Host();
+        _client.Create();
 
         Console.WriteLine($"[ChromaNetClient] Created client for {serverAddress}:{serverPort}");
-    }
-
-    private void OptimizeSocketBuffers()
-    {
-        try
-        {
-            var socketField = _netManager.GetType().GetField("_socket",
-                System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Instance);
-
-            if (socketField?.GetValue(_netManager) is System.Net.Sockets.Socket socket)
-            {
-                socket.SendBufferSize = 1024 * 512;
-                socket.ReceiveBufferSize = 1024 * 512;
-
-                Console.WriteLine($"[ChromaNetClient] Socket buffers optimized: Send={socket.SendBufferSize}, Recv={socket.ReceiveBufferSize}");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ChromaNetClient] Warning: Could not optimize socket buffers: {ex.Message}");
-        }
     }
 
     /// <summary>
@@ -98,13 +74,15 @@ public class ChromaNetClient : IDisposable, INetEventListener
 
         _running = true;
 
-        // Connect to server
-        _serverPeer = _netManager.Connect(_serverAddress, _serverPort, "ChromaNet");
+        Address address = new Address();
+        address.SetHost(_serverAddress);
+        address.Port = (ushort)_serverPort;
+
+        _serverPeer = _client.Connect(address, 1);
 
         OnStatusUpdate?.Invoke($"Connecting to {_serverAddress}:{_serverPort}...");
         Console.WriteLine($"[ChromaNetClient] Connecting to server...");
 
-        // Start network poll loop
         Task.Run(NetworkLoop);
     }
 
@@ -117,8 +95,12 @@ public class ChromaNetClient : IDisposable, INetEventListener
         {
             try
             {
-                _netManager.PollEvents();
-                await Task.Delay(1); // ~1000 FPS poll rate
+                while (_client.Service(0, out Event netEvent) > 0)
+                {
+                    HandleNetworkEvent(netEvent);
+                }
+
+                await Task.Delay(1);
             }
             catch (Exception ex)
             {
@@ -128,13 +110,53 @@ public class ChromaNetClient : IDisposable, INetEventListener
         }
     }
 
+    private void HandleNetworkEvent(Event netEvent)
+    {
+        switch (netEvent.Type)
+        {
+            case EventType.Connect:
+                Console.WriteLine("[ChromaNetClient] Connected to server!");
+                _isConnected = true;
+                OnStatusUpdate?.Invoke("Connected to server");
+                break;
+
+            case EventType.Disconnect:
+                Console.WriteLine("[ChromaNetClient] Disconnected from server");
+                _isConnected = false;
+                OnStatusUpdate?.Invoke("Disconnected from server");
+                OnConnectionLost?.Invoke();
+                break;
+
+            case EventType.Timeout:
+                Console.WriteLine("[ChromaNetClient] Connection timeout");
+                _isConnected = false;
+                OnStatusUpdate?.Invoke("Connection timeout");
+                OnConnectionLost?.Invoke();
+                break;
+
+            case EventType.Receive:
+                byte[] data = new byte[netEvent.Packet.Length];
+                netEvent.Packet.CopyTo(data);
+                netEvent.Packet.Dispose();
+
+                ProcessFramePacket(data);
+                break;
+
+            case EventType.None:
+                break;
+        }
+    }
+
     /// <summary>
     /// Disconnect from server
     /// </summary>
     public void Disconnect()
     {
         _running = false;
-        _serverPeer?.Disconnect();
+        if (_isConnected)
+        {
+            _serverPeer.Disconnect(0);
+        }
     }
 
     /// <summary>
@@ -189,15 +211,6 @@ public class ChromaNetClient : IDisposable, INetEventListener
             }
             blitStopwatch.Stop();
             double totalBlitMs = blitStopwatch.Elapsed.TotalMilliseconds;
-
-            long currentCallbackTime = _callbackIntervalTimer.ElapsedMilliseconds;
-            long intervalMs = currentCallbackTime - _lastCallbackTime;
-            _lastCallbackTime = currentCallbackTime;
-
-            if (intervalMs > 100)
-            {
-                Console.WriteLine($"[ChromaNetClient] WARNING: Long callback interval: {intervalMs}ms");
-            }
 
             var callbackStopwatch = Stopwatch.StartNew();
             OnFrameReceived?.Invoke(
@@ -259,15 +272,12 @@ public class ChromaNetClient : IDisposable, INetEventListener
             double elapsed = (currentTime - _lastReport) / 1000.0;
             double fps = _reportFrameCount / elapsed;
             double mbps = (_totalBytes * 8.0 / 1_000_000.0) / elapsed;
-            int latency = _serverPeer?.Ping ?? 0;
+            int latency = _isConnected ? (int)_serverPeer.RoundTripTime : 0;
 
             string stats = $"FPS: {fps:F1} | BW: {mbps:F2} Mbps | Ping: {latency}ms | Regions: {regionCount}";
-            string timing = $"Timing(ms): Deserialize={deserializeMs:F2} | Decompress={decompressMs:F2} | " +
-                           $"Blit={blitMs:F2} | Callback={callbackMs:F2} | Total={totalMs:F2}";
 
             OnStatusUpdate?.Invoke(stats);
             Console.WriteLine($"[ChromaNetClient] {stats}");
-            Console.WriteLine($"[ChromaNetClient] {timing}");
 
             _totalBytes = 0;
             _reportFrameCount = 0;
@@ -284,51 +294,21 @@ public class ChromaNetClient : IDisposable, INetEventListener
         return _compositeBuffer;
     }
 
-    // INetEventListener implementation
-    public void OnPeerConnected(NetPeer peer)
-    {
-        Console.WriteLine($"[ChromaNetClient] Connected to server");
-        OnStatusUpdate?.Invoke("Connected to server");
-    }
-
-    public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
-    {
-        Console.WriteLine($"[ChromaNetClient] Disconnected: {disconnectInfo.Reason}");
-        OnStatusUpdate?.Invoke($"Disconnected: {disconnectInfo.Reason}");
-    }
-
-    public void OnNetworkError(IPEndPoint endPoint, System.Net.Sockets.SocketError socketError)
-    {
-        Console.WriteLine($"[ChromaNetClient] Network error: {socketError}");
-        OnStatusUpdate?.Invoke($"Network error: {socketError}");
-    }
-
-    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
-    {
-        // Received frame data - OPTIMIZED: Removed Console.WriteLine for performance
-        byte[] data = reader.GetRemainingBytes();
-        ProcessFramePacket(data);
-    }
-
-    public void OnNetworkReceiveUnconnected(IPEndPoint remoteEndPoint, NetPacketReader reader, UnconnectedMessageType messageType)
-    {
-    }
-
-    public void OnNetworkLatencyUpdate(NetPeer peer, int latency)
-    {
-    }
-
-    public void OnConnectionRequest(ConnectionRequest request)
-    {
-        // Client doesn't accept connections
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
 
         Disconnect();
-        _netManager?.Stop();
+
+        _client.Flush();
+        _client.Dispose();
+
+        if (_isENetInitialized)
+        {
+            Library.Deinitialize();
+            _isENetInitialized = false;
+            Console.WriteLine("[ChromaNetClient] ENet library deinitialized");
+        }
 
         _disposed = true;
     }

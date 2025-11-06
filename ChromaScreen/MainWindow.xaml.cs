@@ -287,20 +287,15 @@ public partial class MainWindow : Window
             // Subscribe to frame received events
             _chromaClient.OnFrameReceived += OnClientFrameReceived;
 
-            // Subscribe to status updates to detect disconnection
-            _chromaClient.OnStatusUpdate += (status) =>
+            // Subscribe to connection lost event to close overlay
+            _chromaClient.OnConnectionLost += () =>
             {
                 Dispatcher.Invoke(() =>
                 {
-                    ClientStatusText.Text = status;
-
-                    // Check if disconnected - close overlay
-                    if (status.Contains("Disconnected") || status.Contains("disconnect"))
-                    {
-                        Console.WriteLine("[MainWindow] Server disconnected, closing overlay...");
-                        CloseClientOverlay();
-                        ConnectClientButton.IsEnabled = true;
-                    }
+                    Console.WriteLine("[MainWindow] Server disconnected, closing overlay...");
+                    CloseClientOverlay();
+                    ConnectClientButton.IsEnabled = true;
+                    ClientStatusText.Text = "❌ Disconnected from server";
                 });
             };
 
